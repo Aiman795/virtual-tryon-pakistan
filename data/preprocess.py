@@ -1,34 +1,48 @@
 import json
 import os
-from collections import Counter
+from PIL import Image
 
-# Path to your dataset
+# Paths
 JSON_PATH = "data/raw/Threads of Fashion.coco-segmentation/train/_annotations.coco.json"
 TRAIN_PATH = "data/raw/Threads of Fashion.coco-segmentation/train"
+OUTPUT_PATH = "data/processed"
 
-# Load the JSON file
+# Target size
+TARGET_SIZE = (768, 1024)
+
+# Load JSON
 with open(JSON_PATH, "r") as f:
     data = json.load(f)
 
-# Print all categories
-print("=== ALL CATEGORIES ===")
-categories = data["categories"]
-for cat in categories:
-    print(f"ID: {cat['id']}  Name: {cat['name']}")
+# Get all image filenames
+images = data["images"]
+total = len(images)
 
-print(f"\nTotal categories: {len(categories)}")
+print(f"Total images to process: {total}")
+print("Starting preprocessing...")
 
-# Count images per category
-print("\n=== IMAGE COUNT PER CATEGORY ===")
-cat_id_to_name = {cat["id"]: cat["name"] for cat in categories}
-annotation_counts = Counter()
+success = 0
+failed = 0
 
-for ann in data["annotations"]:
-    annotation_counts[ann["category_id"]] += 1
+for i, img_info in enumerate(images):
+    filename = img_info["file_name"]
+    input_path = os.path.join(TRAIN_PATH, filename)
+    output_path = os.path.join(OUTPUT_PATH, filename)
 
-for cat_id, count in sorted(annotation_counts.items()):
-    print(f"{cat_id_to_name[cat_id]}: {count} images")
+    try:
+        img = Image.open(input_path).convert("RGB")
+        img = img.resize(TARGET_SIZE)
+        img.save(output_path)
+        success += 1
 
-# Total images
-print(f"\nTotal images in dataset: {len(data['images'])}")
-print(f"Total annotations: {len(data['annotations'])}")
+        if (i + 1) % 100 == 0:
+            print(f"Processed {i+1}/{total} images...")
+
+    except Exception as e:
+        print(f"Failed: {filename} — {e}")
+        failed += 1
+
+print(f"\nDone!")
+print(f"Successfully processed: {success}")
+print(f"Failed: {failed}")
+print(f"Saved to: {OUTPUT_PATH}")
