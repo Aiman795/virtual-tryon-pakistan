@@ -114,3 +114,22 @@ with open(VAL_CSV, "w", newline="") as f:
 print(f"\nTrain set: {len(train_rows)} images")
 print(f"Validation set: {len(val_rows)} images")
 print("Done! CSV files saved.")
+
+# ── MERGE WEDDING GUEST + BRIDAL INTO FORMAL ──────────
+import pandas as pd
+
+print("\nMerging Wedding Guest + Bridal into Formal...")
+
+for csv_file in ["data/labels.csv", "data/train.csv", "data/val.csv"]:
+    df = pd.read_csv(csv_file)
+    df["group"] = df["group"].replace({
+        "Wedding Guest": "Formal",
+        "Bridal": "Formal"
+    })
+    df.to_csv(csv_file, index=False)
+    print(f"Updated: {csv_file}")
+
+# Check new counts
+df = pd.read_csv("data/labels.csv")
+print("\nNew group counts:")
+print(df["group"].value_counts())

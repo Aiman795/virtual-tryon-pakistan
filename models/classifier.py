@@ -14,15 +14,13 @@ MODEL_SAVE_PATH = "models/classifier_resnet50.pth"
 NUM_EPOCHS = 10
 BATCH_SIZE = 32
 LEARNING_RATE = 0.001
-NUM_CLASSES = 5  # 5 groups
+NUM_CLASSES = 4
 
-# ── LABEL MAP ─────────────────────────────────────────
 LABEL_MAP = {
-    "Bridal": 0,
-    "Everyday Casual": 1,
-    "Semi Formal": 2,
-    "Wedding Guest": 3,
-    "Other": 4
+    "Everyday Casual": 0,
+    "Other": 1,
+    "Formal": 2,
+    "Semi Formal": 3
 }
 
 # ── DATASET CLASS ─────────────────────────────────────
