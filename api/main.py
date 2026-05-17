@@ -1,6 +1,7 @@
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.concurrency import run_in_threadpool
 import uvicorn
 import shutil
 import os
@@ -13,6 +14,9 @@ from gradio_client import Client, handle_file
 import cv2
 import numpy as np
 import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from xai.gradcam import generate_gradcam
 
 sys.path.append(".")
 from models.fit_score import recommend_size, generate_explanation
@@ -30,7 +34,6 @@ app.add_middleware(
 # ── LOAD MODELS ───────────────────────────────────────
 print("Loading models...")
 
-# Classifier
 LABEL_MAP = {
     0: "Everyday Casual",
     1: "Other",
@@ -52,14 +55,21 @@ transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-# Segmentation
 seg_model = YOLO("models/best.pt")
-SEG_LABELS = {0: "Formal", 1: "Everyday_Casual", 2: "Semi_Formal", 3: "Other"}
 
-# Try-On Client
-tryon_client = Client("yisol/IDM-VTON")
+# ── GRADIO CLIENT WITH TIMEOUT ────────────────────────
+# Increased timeout to handle slow connections / sleeping HF Spaces
+try:
+    tryon_client = Client(
+        "yisol/IDM-VTON",
+        httpx_kwargs={"timeout": 120}  # 120 seconds timeout
+    )
+    print("All models loaded!")
+except Exception as e:
+    print(f"Warning: Could not connect to IDM-VTON space: {e}")
+    print("Try-on endpoint will attempt reconnection at request time.")
+    tryon_client = None
 
-print("All models loaded!")
 
 # ── HELPER FUNCTIONS ──────────────────────────────────
 def classify_garment(image_path):
@@ -71,38 +81,16 @@ def classify_garment(image_path):
     return LABEL_MAP[pred]
 
 
-def segment_garment(image_path):
-    results = seg_model(image_path, conf=0.25)
-    img = cv2.imread(image_path)
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    if not results or results[0].masks is None:
-        return image_path
-
-    result = results[0]
-    if not result.boxes or len(result.boxes) == 0:
-        return image_path
-
-    best_idx = result.boxes.conf.argmax().item()
-    best_box = result.boxes[best_idx]
-    best_mask = result.masks[best_idx]
-
-    x1, y1, x2, y2 = map(int, best_box.xyxy[0].tolist())
-    cropped = img_rgb[y1:y2, x1:x2]
-
-    mask_data = best_mask.data[0].cpu().numpy()
-    mask_resized = cv2.resize(
-        mask_data, (img_rgb.shape[1], img_rgb.shape[0])
-    )
-    mask_crop = mask_resized[y1:y2, x1:x2]
-
-    result_img = np.ones_like(cropped) * 255
-    mask_bool = mask_crop > 0.5
-    result_img[mask_bool] = cropped[mask_bool]
-
-    seg_path = "data/temp_segmented.jpg"
-    Image.fromarray(result_img).save(seg_path)
-    return seg_path
+def get_tryon_client():
+    """Returns existing client or creates a new one if not initialized."""
+    global tryon_client
+    if tryon_client is None:
+        print("Attempting to reconnect to IDM-VTON space...")
+        tryon_client = Client(
+            "yisol/IDM-VTON",
+            httpx_kwargs={"timeout": 120}
+        )
+    return tryon_client
 
 
 # ── ENDPOINTS ─────────────────────────────────────────
@@ -114,16 +102,17 @@ def root():
 
 @app.post("/classify")
 async def classify(file: UploadFile = File(...)):
-    # Save uploaded file
     path = f"data/temp_{file.filename}"
-    with open(path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
-    # Classify
-    category = classify_garment(path)
-    os.remove(path)
-
-    return {"category": category}
+    try:
+        with open(path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        category = classify_garment(path)
+        return {"category": category}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Classification failed: {str(e)}")
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
 
 
 @app.post("/fitscore")
@@ -133,18 +122,20 @@ async def fitscore(
     length: float = Form(...),
     brand: str = Form(...)
 ):
-    size, score, breakdown, all_scores = recommend_size(
-        chest, waist, length, brand
-    )
-    explanation = generate_explanation(chest, waist, length, brand)
-
-    return {
-        "recommended_size": size,
-        "confidence": score,
-        "all_scores": all_scores,
-        "breakdown": breakdown,
-        "explanation": explanation
-    }
+    try:
+        size, score, breakdown, all_scores = recommend_size(
+            chest, waist, length, brand
+        )
+        explanation = generate_explanation(chest, waist, length, brand)
+        return {
+            "recommended_size": size,
+            "confidence": score,
+            "all_scores": all_scores,
+            "breakdown": breakdown,
+            "explanation": explanation
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Fit score failed: {str(e)}")
 
 
 @app.post("/tryon")
@@ -156,63 +147,115 @@ async def tryon(
     length: float = Form(0),
     brand: str = Form("Khaadi")
 ):
-    # Save uploads
-    person_path = f"data/temp_person.jpg"
-    garment_path = f"data/temp_garment.jpg"
+    person_path = "data/temp_person.jpg"
+    garment_path = "data/temp_garment.jpg"
 
-    with open(person_path, "wb") as f:
-        shutil.copyfileobj(person.file, f)
-    with open(garment_path, "wb") as f:
-        shutil.copyfileobj(garment.file, f)
+    # Save uploaded files
+    try:
+        with open(person_path, "wb") as f:
+            shutil.copyfileobj(person.file, f)
+        with open(garment_path, "wb") as f:
+            shutil.copyfileobj(garment.file, f)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded files: {str(e)}")
 
     # Step 1 — Classify garment
-    category = classify_garment(garment_path)
+    try:
+        category = classify_garment(garment_path)
+    except Exception as e:
+        category = "Everyday Casual"  # fallback
+        print(f"Classification warning: {e}")
 
-    # Step 2 — Segment garment
-    clean_garment = segment_garment(garment_path)
+    # Step 2 — Try-On
+    def call_tryon():
+        client = get_tryon_client()
+        return client.predict(
+            dict={"background": handle_file(person_path),
+                  "layers": [], "composite": None},
+            garm_img=handle_file(garment_path),
+            garment_des=f"Pakistani {category} garment",
+            is_checked=True,
+            is_checked_crop=False,
+            denoise_steps=30,
+            seed=42,
+            api_name="/tryon"
+        )
 
-    # Step 3 — Try-On
-    result = tryon_client.predict(
-        dict={"background": handle_file(person_path),
-              "layers": [], "composite": None},
-        garm_img=handle_file(clean_garment),
-        garment_des=f"Pakistani {category} garment",
-        is_checked=True,
-        is_checked_crop=False,
-        denoise_steps=30,
-        seed=42,
-        api_name="/tryon"
-    )
+    tryon_error = None
+    result = None
+    try:
+        result = await run_in_threadpool(call_tryon)
+    except Exception as e:
+        tryon_error = str(e)
+        print(f"Try-on error: {e}")
 
+    # Save output image if successful
     output_path = "data/tryon_output.jpg"
-    if result and result[0]:
-        shutil.copy(result[0], output_path)
+    tryon_image_url = None
 
-    # Step 4 — Fit Score
+    if result and result[0]:
+        try:
+            shutil.copy(result[0], output_path)
+            tryon_image_url = "/result"
+        except Exception as e:
+            print(f"Failed to save output image: {e}")
+
+    # Step 3 — Fit Score
     fit_result = {}
     if chest > 0 and waist > 0 and length > 0:
-        size, score, breakdown, all_scores = recommend_size(
-            chest, waist, length, brand
-        )
-        explanation = generate_explanation(chest, waist, length, brand)
-        fit_result = {
-            "recommended_size": size,
-            "confidence": score,
-            "explanation": explanation
-        }
+        try:
+            size, score, breakdown, all_scores = recommend_size(
+                chest, waist, length, brand
+            )
+            explanation = generate_explanation(chest, waist, length, brand)
+            fit_result = {
+                "recommended_size": size,
+                "confidence": score,
+                "explanation": explanation
+            }
+        except Exception as e:
+            print(f"Fit score warning: {e}")
 
-    return {
+    # Return response (with error info if tryon failed)
+    response = {
         "category": category,
-        "tryon_image": "/result",
+        "tryon_image": tryon_image_url,
         "fit_score": fit_result
     }
+
+    if tryon_error:
+        response["tryon_error"] = f"Try-on failed (timeout or connection issue): {tryon_error}"
+
+    return response
 
 
 @app.get("/result")
 def get_result():
-    return FileResponse("data/tryon_output.jpg")
+    output_path = "data/tryon_output.jpg"
+    if not os.path.exists(output_path):
+        raise HTTPException(status_code=404, detail="No result image found. Run /tryon first.")
+    return FileResponse(output_path)
+
+@app.post("/gradcam")
+async def gradcam(file: UploadFile = File(...)):
+    path = "data/temp_gradcam.jpg"
+    with open(path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    def run_gradcam():
+        return generate_gradcam(path, "data/gradcam_result.jpg")
+
+    result_path, label = await run_in_threadpool(run_gradcam)
+
+    return {
+        "label": label,
+        "gradcam_image": "/gradcam_result"
+    }
 
 
-# ── RUN ───────────────────────────────────────────────
+@app.get("/gradcam_result")
+def get_gradcam():
+    return FileResponse("data/gradcam_result.jpg")
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
